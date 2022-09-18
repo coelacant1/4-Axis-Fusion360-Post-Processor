@@ -259,6 +259,14 @@ properties = {
     type       : "number",
     value      : 0,
     scope      : "post"
+  },
+  laserPWMPower: {
+    title      : "Laser PWM Power",
+    description: "Enter the PWM output power for the laser",
+    group      : "Laser",
+    type       : "integer",
+    value      : 0,
+    scope      : "post"
   }
 };
 
@@ -302,6 +310,7 @@ var feedOutput = createVariable({prefix:"F"}, feedFormat);
 var inverseTimeOutput = createVariable({prefix:"F", force:true}, inverseTimeFormat);
 var sOutput = createVariable({}, rpmFormat);
 var dOutput = createVariable({}, dFormat);
+var pwmOutput = createVariable({prefix:"S", force:true});
 
 // circular output
 var iOutput = createReferenceVariable({prefix:"I", force:true}, xyzFormat);
@@ -326,6 +335,8 @@ var coolantZHeight;
 var masterAxis;
 var movementType;
 var retracted = false; // specifies that the tool has been retracted to the safe plane
+var laserDeactivated = false;
+var laserActivated = false;
 
 function formatSequenceNumber() {
   if (sequenceNumber > 99999) {
@@ -570,13 +581,16 @@ function onOpen() {
 
   sequenceNumber = getProperty("sequenceNumberStart");
 
-  writeln("%");
   if (programName) {
     writeComment(programName);
   }
   if (programComment) {
     writeComment(programComment);
   }
+
+  writeComment("Homing");
+  writeBlock("G28");
+  writeBlock("M106 P2 S255");// Enable fan
 
   if (getProperty("writeVersion")) {
     if (typeof getHeaderVersion == "function" && getHeaderVersion()) {
@@ -637,33 +651,6 @@ function onOpen() {
         }
         comment += " - " + getToolTypeName(tool.type);
         writeComment(comment);
-      }
-    }
-  }
-
-  if (false) {
-    // check for duplicate tool number
-    for (var i = 0; i < getNumberOfSections(); ++i) {
-      var sectioni = getSection(i);
-      var tooli = sectioni.getTool();
-      for (var j = i + 1; j < getNumberOfSections(); ++j) {
-        var sectionj = getSection(j);
-        var toolj = sectionj.getTool();
-        if (tooli.number == toolj.number) {
-          if (xyzFormat.areDifferent(tooli.diameter, toolj.diameter) ||
-              xyzFormat.areDifferent(tooli.cornerRadius, toolj.cornerRadius) ||
-              abcFormat.areDifferent(tooli.taperAngle, toolj.taperAngle) ||
-              (tooli.numberOfFlutes != toolj.numberOfFlutes)) {
-            error(
-              subst(
-                localize("Using the same tool number for different cutter geometry for operation '%1' and '%2'."),
-                sectioni.hasParameter("operation-comment") ? sectioni.getParameter("operation-comment") : ("#" + (i + 1)),
-                sectionj.hasParameter("operation-comment") ? sectionj.getParameter("operation-comment") : ("#" + (j + 1))
-              )
-            );
-            return;
-          }
-        }
       }
     }
   }
@@ -980,13 +967,6 @@ function onSection() {
       return;
     }
 
-    if (getProperty("useM06")) {
-      writeToolBlock("T" + toolFormat.format(tool.number),
-        gFormat.format(43),
-        hFormat.format(lengthOffset),
-        mFormat.format(6));
-    }
-
     if (tool.comment) {
       writeComment(tool.comment);
     }
@@ -1019,24 +999,6 @@ function onSection() {
 
   forceXYZ();
 
-  if (machineConfiguration.isMultiAxisConfiguration()) { // use 5-axis indexing for multi-axis mode
-    var abc = currentSection.isMultiAxis() ? currentSection.getInitialToolAxisABC() : getWorkPlaneMachineABC(currentSection.workPlane);
-    if (currentSection.isMultiAxis()) {
-      forceWorkPlane();
-      cancelTransformation();
-      positionABC(abc, true);
-    } else {
-      setWorkPlane(abc);
-    }
-  } else { // pure 3D
-    var remaining = currentSection.workPlane;
-    if (!isSameDirection(remaining.forward, new Vector(0, 0, 1))) {
-      error(localize("Tool orientation is not supported."));
-      return;
-    }
-    setRotation(remaining);
-  }
-
   if (currentSection) {
     operationSupportsTCP = (currentSection.isMultiAxis() || !useMultiAxisFeatures) && currentSection.getOptimizedTCPMode() == OPTIMIZE_NONE;
   }
@@ -1050,46 +1012,48 @@ function onSection() {
       writeBlock(gMotionModal.format(0), zOutput.format(initialPosition.z));
     }
   }
+  
+  writeBlock("; Moving to start position");
+  laserDeactivated = true;
+  laserActivated = false;
 
-
-  if (!insertToolCall && retracted) { // G43 already called above on tool change
-    var lengthOffset = tool.lengthOffset;
-    if (lengthOffset > getProperty("maxTool")) {
-      error(localize("Length offset out of range."));
-      return;
-    }
-
-    gMotionModal.reset();
-    writeBlock(gPlaneModal.format(17));
-
-
-    if (!machineConfiguration.isHeadConfiguration()) {
-      writeBlock(
-        gAbsIncModal.format(90),
-        gMotionModal.format(0), xOutput.format(initialPosition.x), yOutput.format(initialPosition.y)
-      );
-      writeBlock(gMotionModal.format(0), gFormat.format(43), zOutput.format(initialPosition.z), hFormat.format(lengthOffset));
-    } else {
-      writeBlock(
-        gAbsIncModal.format(90),
-        gMotionModal.format(0),
-        gFormat.format(43), xOutput.format(initialPosition.x),
-        yOutput.format(initialPosition.y),
-        zOutput.format(initialPosition.z), hFormat.format(lengthOffset)
-      );
-    }
-  } else {
-    writeBlock(
-      gAbsIncModal.format(90),
-      gMotionModal.format(0),
-      xOutput.format(initialPosition.x),
-      yOutput.format(initialPosition.y)
-    );
+  var abc = currentSection.isMultiAxis() ? currentSection.getInitialToolAxisABC() : getWorkPlaneMachineABC(currentSection.workPlane);
+  if (typeof unwindABC == "function") {
+    unwindABC(abc, false);
   }
 
-  writeBlock(";Line 1066")
+  var x = xOutput.format(initialPosition.x + getProperty("workSpaceOffsetX"));
+  var y = yOutput.format(initialPosition.y + getProperty("workSpaceOffsetY"));
+  var z = zOutput.format(initialPosition.z + getProperty("workSpaceOffsetZ"));
+  var a = aOutput.format(abc.x);
+  var b = bOutput.format(abc.y);
+  var c = cOutput.format(abc.z);
+  if (a || b || c) {
+    if (!retracted) {
+      if (typeof moveToSafeRetractPosition == "function") {
+        moveToSafeRetractPosition();
+      } else {
+        writeRetract(Z);
+      }
+    }
+    
+    x = xOutput.format(initialPosition.x * Math.cos(-1 * abc.y) - initialPosition.y * Math.sin(-1 * abc.y) + getProperty("workSpaceOffsetX"));
+    y = yOutput.format(initialPosition.y * Math.cos(-1 * abc.y) + initialPosition.x * Math.sin(-1 * abc.y) + getProperty("workSpaceOffsetY"));
 
-  writeBlock("M106 P1 S128 ; Laser at 50%")
+    onCommand(COMMAND_UNLOCK_MULTI_AXIS);
+    gMotionModal.reset();
+    writeBlock(gMotionModal.format(0), x, y, z, a, b, c);
+    currentMachineABC = new Vector(abc);
+    setCurrentABC(abc); // required for machine simulation
+  }
+  else{
+    writeBlock(
+      gMotionModal.format(0),
+      xOutput.format(initialPosition.x),
+      yOutput.format(initialPosition.y),
+      zOutput.format(initialPosition.z)
+    );
+  }
 }
 
 // allow manual insertion of comma delimited g-code
@@ -1116,90 +1080,8 @@ function onSpindleSpeed(spindleSpeed) {
   writeBlock(sOutput.format(spindleSpeed));
 }
 
-function setCoolant(coolant, topOfPart) {
-  var coolCodes = ["", "", "", ""];
-  coolantZHeight = 9999.0;
-  var coolantCode = 9;
-
-  if (!getProperty("outputCoolants")) {
-    return coolCodes;
-  }
-  // Smart coolant is not enabled
-  if (!getProperty("smartCoolEquipped")) {
-    if (coolant == COOLANT_OFF) {
-      coolantCode = 9;
-    } else if (coolant == COOLANT_MIST) {
-      coolantCode = 7;
-    } else {
-      coolantCode = 8; // default all coolant modes to flood
-      if (coolant != COOLANT_FLOOD) {
-        warning(localize("Unsupported coolant setting. Defaulting to FLOOD."));
-      }
-    }
-    coolCodes[0] = mFormat.format(coolantCode);
-  } else { // Smart coolant is enabled
-    if ((coolant == COOLANT_MIST) || (coolant == COOLANT_AIR)) {
-      coolantCode = 7;
-      coolCodes[0] = mFormat.format(coolantCode);
-    } else if (coolant == COOLANT_FLOOD_MIST) { // flood with air blast
-      coolantCode = 8;
-      coolCodes[0] = mFormat.format(coolantCode);
-      if (getProperty("multiCoolEquipped")) {
-        if (getProperty("multiCoolAirBlastSeconds") != 0) {
-          coolCodes[3] = qFormat.format(getProperty("multiCoolAirBlastSeconds"));
-        }
-      } else {
-        warning(localize("COOLANT_FLOOD_MIST programmed without Multi-Coolant support. Defaulting to FLOOD."));
-      }
-    } else if (coolant == COOLANT_OFF) {
-      coolantCode = 9;
-      coolCodes[0] = mFormat.format(coolantCode);
-    } else {
-      coolantCode = 8;
-      coolCodes[0] = mFormat.format(coolantCode);
-      if (coolant != COOLANT_FLOOD) {
-        warning(localize("Unsupported coolant setting. Defaulting to FLOOD."));
-      }
-    }
-
-    // Determine Smart Coolant location based on machining operation
-    if (hasParameter("operation-strategy")) {
-      var strategy = getParameter("operation-strategy");
-      if (strategy) {
-
-        // Drilling strategy. Keep coolant at top of part
-        if (strategy == "drill") {
-          if (topOfPart != undefined) {
-            coolantZHeight = topOfPart;
-            coolCodes[1] = "E" + xyzFormat.format(coolantZHeight);
-          }
-
-        // Tool end point milling. Keep coolant at end of tool
-        } else if ((strategy == "face") ||
-                   (strategy == "engrave") ||
-                   (strategy == "contour_new") ||
-                   (strategy == "horizontal_new") ||
-                   (strategy == "parallel_new") ||
-                   (strategy == "scallop_new") ||
-                   (strategy == "pencil_new") ||
-                   (strategy == "radial_new") ||
-                   (strategy == "spiral_new") ||
-                   (strategy == "morphed_spiral") ||
-                   (strategy == "ramp") ||
-                   (strategy == "project")) {
-          coolCodes[1] = "P" + coolantOptionFormat.format(0);
-
-        // Side Milling. Sweep the coolant along the length of the tool
-        } else {
-          coolCodes[1] = "P" + coolantOptionFormat.format(0);
-          coolCodes[2] = "R" + xyzFormat.format(tool.fluteLength * (getProperty("smartCoolToolSweepPercentage") / 100.0));
-        }
-      }
-    }
-  }
-
-  currentCoolantMode = coolant;
-  return coolCodes;
+function setCoolant() {
+  return;
 }
 
 function onCycle() {
@@ -1447,6 +1329,13 @@ function onRapid(_x, _y, _z) {
   var z = zOutput.format(_z + getProperty("workSpaceOffsetZ"));
 
   if (x || y || z) {
+    if(!laserDeactivated){
+      writeBlock("M106 P0 S0 ; Laser disable power");
+      writeBlock("M106 P1 S0 ; Laser pwm at 0%");
+      laserDeactivated = true;
+      laserActivated = false;
+    }
+
     if (pendingRadiusCompensation >= 0) {
       error(localize("Radius compensation mode cannot be changed at rapid traversal."));
       return;
@@ -1463,35 +1352,42 @@ function onLinear(_x, _y, _z, feed) {
   var f = feedOutput.format(feed);
 
   if (x || y || z) {
+    if(!laserActivated){
+      writeBlock("M106 P0 S255 ; Laser enable power");
+      writeBlock("M106 P1", pwmOutput.format(getProperty("laserPWMPower")), " ; Laser pwm at 50%");
+      laserActivated = true;
+      laserDeactivated = false;
+    }
+    
     if (pendingRadiusCompensation >= 0) {
       pendingRadiusCompensation = -1;
       var d = tool.diameterOffset;
       if (d > getProperty("maxTool")) {
         warning(localize("The diameter offset exceeds the maximum value."));
       }
-      writeBlock(gPlaneModal.format(17));
+      
       switch (radiusCompensation) {
       case RADIUS_COMPENSATION_LEFT:
         dOutput.reset();
-        writeBlock(gFeedModeModal.format(94), gMotionModal.format(1), gFormat.format(41), x, y, z, dOutput.format(d), f);
+        writeBlock(gMotionModal.format(1), gFormat.format(41), x, y, z, dOutput.format(d), f);
         // error(localize("Radius compensation mode is not supported by the CNC control."));
         break;
       case RADIUS_COMPENSATION_RIGHT:
         dOutput.reset();
-        writeBlock(gFeedModeModal.format(94), gMotionModal.format(1), gFormat.format(42), x, y, z, dOutput.format(d), f);
+        writeBlock(gMotionModal.format(1), gFormat.format(42), x, y, z, dOutput.format(d), f);
         // error(localize("Radius compensation mode is not supported by the CNC control."));
         break;
       default:
-        writeBlock(gFeedModeModal.format(94), gMotionModal.format(1), gFormat.format(40), x, y, z, f);
+        writeBlock(gMotionModal.format(1), gFormat.format(40), x, y, z, f);
       }
     } else {
-      writeBlock(gFeedModeModal.format(94), gMotionModal.format(1), x, y, z, f);
+      writeBlock(gMotionModal.format(1), x, y, z, f);
     }
   } else if (f) {
     if (getNextRecord().isMotion()) { // try not to output feed without motion
       feedOutput.reset(); // force feed on next line
     } else {
-      writeBlock(gFeedModeModal.format(94), gMotionModal.format(1), f);
+      writeBlock(gMotionModal.format(1), f);
     }
   }
 }
@@ -1505,6 +1401,7 @@ function onRapid5D(_x, _y, _z, _a, _b, _c) {
     error(localize("Radius compensation mode cannot be changed at rapid traversal."));
     return;
   }
+  
   var x = xOutput.format(_x + getProperty("workSpaceOffsetX"));
   var y = yOutput.format(_y + getProperty("workSpaceOffsetY"));
   var z = zOutput.format(_z + getProperty("workSpaceOffsetZ"));
@@ -1521,8 +1418,18 @@ function onRapid5D(_x, _y, _z, _a, _b, _c) {
     //writeBlock("; ny: ", ny, " y: ", y);
     //writeBlock("; _b: ", _b, " b: ", b);
   }
+  else{
+    return;
+  }
 
   if (x || y || z || a || b || c) {
+    if(!laserDeactivated){
+      writeBlock("M106 P0 S0 ; Laser disable power");
+      writeBlock("M106 P1 S0 ; Laser pwm at 0%");
+      laserDeactivated = true;
+      laserActivated = false;
+    }
+
     writeBlock(gMotionModal.format(0), x, y, z, a, b, c);
     feedOutput.reset();
   }
@@ -1553,96 +1460,35 @@ function onLinear5D(_x, _y, _z, _a, _b, _c, feed, feedMode) {
     //writeBlock("; ny: ", ny, " y: ", y);
     //writeBlock("; _b: ", _b, " b: ", b);
   }
+  else{
+    return;
+  }
 
   if (feedMode == FEED_INVERSE_TIME) {
     feedOutput.reset();
   }
   var f = feedMode == FEED_INVERSE_TIME ? inverseTimeOutput.format(feed) : feedOutput.format(feed);
-  var fMode = feedMode == FEED_INVERSE_TIME ? 93 : 94;
 
   if (x || y || z || a || b || c) {
-    writeBlock(gFeedModeModal.format(fMode), gMotionModal.format(1), x, y, z, a, b, c, f);
+    if(!laserActivated){
+      writeBlock("M106 P0 S255 ; Laser enable power");
+      writeBlock("M106 P1", pwmOutput.format(getProperty("laserPWMPower")), " ; Laser pwm at 50%");
+      laserActivated = true;
+      laserDeactivated = false;
+    }
+
+    writeBlock(gMotionModal.format(1), x, y, z, a, b, c, f);
   } else if (f) {
     if (getNextRecord().isMotion()) { // try not to output feed without motion
       feedOutput.reset(); // force feed on next line
     } else {
-      writeBlock(gFeedModeModal.format(fMode), gMotionModal.format(1), f);
+      writeBlock(gMotionModal.format(1), f);
     }
   }
 }
 
-function onCircular(clockwise, cx, cy, cz, x, y, z, feed) {
-  if (pendingRadiusCompensation >= 0) {
-    error(localize("Radius compensation cannot be activated/deactivated for a circular move."));
-    return;
-  }
-
-  // controller does not handle transition between planes well
-  if (((movementType == MOVEMENT_LEAD_IN) ||
-       (movementType == MOVEMENT_LEAD_OUT) ||
-       (movementType == MOVEMENT_RAMP) ||
-       (movementType == MOVEMENT_PLUNGE) ||
-       (movementType == MOVEMENT_RAMP_HELIX) ||
-       (movementType == MOVEMENT_RAMP_PROFILE) ||
-       (movementType == MOVEMENT_RAMP_ZIG_ZAG)) &&
-       (getCircularPlane() != PLANE_XY)) {
-    linearize(tolerance);
-    return;
-  }
-
-  var start = getCurrentPosition();
-  
-  if (isFullCircle()) {
-    if (getProperty("useRadius") || isHelical()) { // radius mode does not support full arcs
-      linearize(tolerance);
-      return;
-    }
-    switch (getCircularPlane()) {
-    case PLANE_XY:
-      writeBlock(gAbsIncModal.format(90), gPlaneModal.format(17), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), iOutput.format(cx - start.x, 0), jOutput.format(cy - start.y, 0), feedOutput.format(feed));
-      break;
-    case PLANE_ZX:
-      writeBlock(gAbsIncModal.format(90), gPlaneModal.format(18), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), iOutput.format(cx - start.x, 0), kOutput.format(cz - start.z, 0), feedOutput.format(feed));
-      break;
-    case PLANE_YZ:
-      writeBlock(gAbsIncModal.format(90), gPlaneModal.format(19), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), jOutput.format(cy - start.y, 0), kOutput.format(cz - start.z, 0), feedOutput.format(feed));
-      break;
-    default:
-      linearize(tolerance);
-    }
-  } else if (!getProperty("useRadius")) {
-    switch (getCircularPlane()) {
-    case PLANE_XY:
-      writeBlock(gAbsIncModal.format(90), gPlaneModal.format(17), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), iOutput.format(cx - start.x, 0), jOutput.format(cy - start.y, 0), feedOutput.format(feed));
-      break;
-    case PLANE_ZX:
-      writeBlock(gAbsIncModal.format(90), gPlaneModal.format(18), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), iOutput.format(cx - start.x, 0), kOutput.format(cz - start.z, 0), feedOutput.format(feed));
-      break;
-    case PLANE_YZ:
-      writeBlock(gAbsIncModal.format(90), gPlaneModal.format(19), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), jOutput.format(cy - start.y, 0), kOutput.format(cz - start.z, 0), feedOutput.format(feed));
-      break;
-    default:
-      linearize(tolerance);
-    }
-  } else { // use radius mode
-    var r = getCircularRadius();
-    if (toDeg(getCircularSweep()) > (180 + 1e-9)) {
-      r = -r; // allow up to <360 deg arcs
-    }
-    switch (getCircularPlane()) {
-    case PLANE_XY:
-      writeBlock(gPlaneModal.format(17), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), "R" + rFormat.format(r), feedOutput.format(feed));
-      break;
-    case PLANE_ZX:
-      writeBlock(gPlaneModal.format(18), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), "R" + rFormat.format(r), feedOutput.format(feed));
-      break;
-    case PLANE_YZ:
-      writeBlock(gPlaneModal.format(19), gFeedModeModal.format(94), gMotionModal.format(clockwise ? 2 : 3), xOutput.format(x), yOutput.format(y), zOutput.format(z), "R" + rFormat.format(r), feedOutput.format(feed));
-      break;
-    default:
-      linearize(tolerance);
-    }
-  }
+function onCircular() {
+  return;
 }
 
 var mapCommand = {
@@ -1683,11 +1529,9 @@ function onCommand(command) {
 }
 
 function onSectionEnd() {
-  writeBlock(gPlaneModal.format(17));
-
-  if (currentSection.isMultiAxis()) {
-    writeBlock(gFeedModeModal.format(94)); // inverse time feed off
-  }
+  writeBlock("M106 P0 S0 ; Laser disable power");
+  writeBlock("M106 P1 S0 ; Laser pwm at 0%");
+  writeBlock(gMotionModal.format(1), xOutput.format(20));//manual retraction
 
   if (((getCurrentSectionId() + 1) >= getNumberOfSections()) ||
       (tool.number != getNextSection().getTool().number)) {
@@ -1695,14 +1539,6 @@ function onSectionEnd() {
   }
 
   forceAny();
-
-  if (((getCurrentSectionId() + 1) >= getNumberOfSections()) ||
-      (tool.number != getNextSection().getTool().number)) {
-    writeBlock(
-      mFormat.format(5),
-      mFormat.format(9)
-    );
-  }
 
   // the code below gets the machine angles from previous operation.  closestABC must also be set to true
   if (currentSection.isMultiAxis() && currentSection.isOptimizedForMachine()) {
@@ -1860,8 +1696,9 @@ function onClose() {
 
   onImpliedCommand(COMMAND_END);
   onImpliedCommand(COMMAND_STOP_SPINDLE);
-  writeBlock(mFormat.format(30)); // stop program, spindle stop, coolant off
-  writeln("%");
+  writeBlock("M106 P2 S0");// Disable fan
+  writeBlock("M106 P0 S0 ; Laser disable power");
+  writeBlock("M106 P1 S0 ; Laser pwm at 0%");
 }
 
 function setProperty(property, value) {
